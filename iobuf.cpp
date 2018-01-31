@@ -1,9 +1,11 @@
-#include<openssl/ssl.h>
 #include<assert.h>
 #include"iobuf.h"
 
 std::atomic_size_t g_nblock = { 0 };
 std::atomic_size_t g_blockmem = { 0 };
+
+void* (*blockmem_allocate)(size_t) = ::malloc;
+void (*blockmem_deallocate)(void*) = ::free;
 
 struct IOBuf::Block {
 
@@ -30,7 +32,7 @@ struct IOBuf::Block {
 			g_nblock.fetch_sub(1, std::memory_order_relaxed);
 			g_blockmem.fetch_sub(cap + offsetof(Block, data), std::memory_order_relaxed);
 			this->~Block();
-			::free(this);
+			blockmem_deallocate(this);
 		}
 	}
 
@@ -44,8 +46,21 @@ struct IOBuf::Block {
 
 };
 
+struct TLSData {
+	IOBuf::Block* block_head;
+
+	int num_blocks;
+};
+
+static TLSData g_tls_data = { NULL, 0 };
+
+IOBuf::Block* get_portal_next(IOBuf::Block const* b) {
+	return b->portal_next;
+}
+IOBuf::Block* get_tls_block_head() { return g_tls_data.block_head; }
+
 inline IOBuf::Block* create_block(const size_t block_size) {
-	void* mem = ::malloc(block_size);
+	void* mem = blockmem_allocate(block_size);
 	if(mem != NULL) {
 		return new (mem) IOBuf::Block(block_size);
 	}
@@ -55,13 +70,6 @@ inline IOBuf::Block* create_block() {
 	return create_block(IOBuf::DEFAULT_BLOCK_SIZE);
 }
 
-struct TLSData {
-	IOBuf::Block* block_head;
-
-	int num_blocks;
-};
-
-static TLSData g_tls_data = { NULL, 0 };
 
 inline IOBuf::Block* acquire_tls_block() {
 	TLSData& tls_data = g_tls_data;
@@ -231,6 +239,141 @@ size_t IOBuf::copy_to(void* d, size_t n, size_t pos) const {
 	return n - m;
 }
 
+size_t IOBuf::pop_front(size_t n) {
+	const size_t len = length();
+	if (n >= len) {
+		clear();
+		return len;
+	}
+	const size_t saved_n = n;
+	while (n) {
+		IOBuf::BlockRef &r = _front_ref();
+		if (r.length > n) {
+			r.offset +=n;
+			r.length -= n;
+			if (!_small()) {
+				_bv.nbytes -=n;
+			}
+			return saved_n;
+		}
+		n -= r.length;
+		_pop_front_ref();
+	}
+	return saved_n;
+}
+
+int IOBuf::_pop_front_ref() {
+	if (_small()) {
+		if (_sv.refs[0].block != NULL) {
+			_sv.refs[0].block->dec_ref();
+			_sv.refs[0] = _sv.refs[1];
+			_sv.refs[1].offset = 0;
+			_sv.refs[1].length = 0;
+			_sv.refs[1].block = NULL;
+			return 0;
+		}
+		return -1;
+	} else {
+		const uint32_t start = _bv.start;
+		_bv.refs[start].block->dec_ref();
+		if (--_bv.nref > 2) {
+			_bv.start = (start + 1) & _bv.cap_mask;
+			_bv.nbytes -= _bv.refs[start].length;
+		} else { //to smallview
+			BlockRef* const saved_refs = _bv.refs;
+			const uint32_t saved_cap_mask = _bv.cap_mask;
+			_sv.refs[0] = saved_refs[(start + 1) & saved_cap_mask];
+			_sv.refs[1] = saved_refs[(start + 1) & saved_cap_mask];
+			release_blockref_array(saved_refs, saved_cap_mask + 1);
+		}
+		return 0;
+	}
+}
+
+ssize_t IOBuf::cut_into_SSL_channel(SSL* ssl, int* ssl_error) {
+	*ssl_error = SSL_ERROR_NONE;
+	if (empty()) {
+		return 0;
+	}
+
+	IOBuf::BlockRef const& r = _ref_at(0);
+	const int nw = SSL_write(ssl, r.block->data + r.offset, r.length);
+	if (nw > 0) {
+		pop_front(nw);
+	}
+	*ssl_error = SSL_get_error(ssl, nw);
+	return nw;
+}
+
+size_t IOBuf::cutn(IOBuf* out, size_t n) {
+	const size_t len = length();
+	if (n > len) {
+		n = len;
+	}
+	const size_t saved_n = n;
+	while (n) {
+		IOBuf::BlockRef &r = _front_ref();
+		if (r.length <= n) {
+			out->_push_back_ref(r);
+			n -= r.length;
+			_pop_front_ref();
+		} else {
+			const IOBuf::BlockRef cr = { r.offset, (uint32_t)n, r.block };
+			out->_push_back_ref(cr);
+
+			r.offset += n;
+			r.length -= n;
+			if (!_small()) {
+				_bv.nbytes -= n;
+			}
+			return saved_n;
+		}
+	}
+	return saved_n;
+}
+
+size_t IOBuf::cutn(void* out, size_t n) {
+	const size_t len = length();
+	if (n > len) {
+		n = len;
+	}
+	const size_t saved_n = n;
+	while (n) {
+		IOBuf::BlockRef &r = _front_ref();
+		if (r.length <= n) {
+			memcpy(out, r.block->data + r.offset, r.length);
+			out = (char*)out + r.length;
+			n -= r.length;
+			_pop_front_ref();
+		} else {
+			memcpy(out, r.block->data + r.offset, n);
+			out = (char*)out + n;
+
+			r.offset += n;
+			r.length -= n;
+			if (!_small()) {
+				_bv.nbytes -= n;
+			}
+			return saved_n;
+		}
+	}
+	return saved_n;
+}
+
+size_t IOBuf::cutn(std::string* out, size_t n) {
+	if (n == 0) {
+		return 0;
+	}
+	const size_t len = length();
+	if (n > len) {
+		n = len;
+	}
+	const size_t old_size = out->size();
+	out->resize(out->size() + n);
+	cutn(&out[0][old_size], n);
+	return n;
+}
+
 size_t IOBuf::copy_to(std::string* s, size_t n, size_t pos) const {
 	const size_t len = length();
 	if (n + pos > len) {
@@ -286,7 +429,7 @@ ssize_t IOPortal::append_from_SSL_channel(SSL* ssl, int* ssl_error) {
 		_block = acquire_tls_block();
 		if(!_block) {
 			//TODO
-			*ssl_error = -1;
+			*ssl_error = SSL_ERROR_SYSCALL;
 			return -1;
 		}
 	}

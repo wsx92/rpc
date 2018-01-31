@@ -3,6 +3,7 @@
 
 #include<atomic>
 #include<string>
+#include<openssl/ssl.h>
 
 class IOBuf {
 public:
@@ -47,6 +48,14 @@ public:
 	size_t length() const { return _small() ? (_sv.refs[0].length + _sv.refs[1].length) : _bv.nbytes; }
 	size_t size() const { return length(); }
 
+	size_t pop_front(size_t n);
+
+
+	ssize_t cut_into_SSL_channel(SSL* ssl, int* ssl_error);
+
+	size_t cutn(IOBuf* out, size_t n);
+	size_t cutn(void* out, size_t n);
+	size_t cutn(std::string* out, size_t n);
 	size_t copy_to(void* buf, size_t n = (size_t)-1L, size_t pos = 0) const;
 	size_t copy_to(std::string* s, size_t n = (size_t)-1L, size_t pos = 0) const;
 	
@@ -70,6 +79,9 @@ protected:
 
 	BlockRef& _ref_at(size_t i) { return _small() ? _sv.refs[i] : _bv.ref_at(i); }
 	const BlockRef& _ref_at(size_t i) const { return _small() ? _sv.refs[i] : _bv.ref_at(i); }
+
+	int _pop_front_ref();
+	BlockRef& _front_ref() { return _small() ? _sv.refs[0] : _bv.ref_at(_bv.start); }
 private:
 	union {
 		BigView _bv;
