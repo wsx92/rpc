@@ -1,5 +1,5 @@
 #include<gtest/gtest.h>
-#include<set>
+#include<unordered_set>
 #include "iobuf.h"
 
 extern void* (*blockmem_allocate)(size_t);
@@ -8,7 +8,7 @@ extern IOBuf::Block* get_tls_block_head();
 extern void remove_tls_block_chain();
 extern IOBuf::Block* get_portal_next(IOBuf::Block const*);
 
-static std::set<void*> s_set;
+static std::unordered_set<void*> s_set;
 
 void* debug_block_allocate(size_t block_size) {
 	void* b = operator new (block_size, std::nothrow);
@@ -80,6 +80,7 @@ TEST_F(IOBufTest, pop_front) {
 	ASSERT_EQ(0UL, buf.length());
 	ASSERT_TRUE(buf.empty());	
 
+	remove_tls_block_chain();
 }
 
 int main(int argc, char** argv) {
